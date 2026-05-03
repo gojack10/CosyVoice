@@ -7,7 +7,7 @@ stop_stage=3
 
 data_url=www.openslr.org/resources/60
 data_dir=/mnt/lyuxiang.lx/data/tts/openslr/libritts
-pretrained_model_dir=../../../pretrained_models/CosyVoice3-0.5B
+pretrained_model_dir=../../../pretrained_models/Fun-CosyVoice3-0.5B
 
 if [ ${stage} -le -1 ] && [ ${stop_stage} -ge -1 ]; then
   echo "Data Download"
@@ -20,10 +20,12 @@ if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
   echo "Data preparation, prepare wav.scp/text/utt2spk/spk2utt"
   for x in train-clean-100 train-clean-360 train-other-500 dev-clean dev-other test-clean test-other; do
     mkdir -p data/$x
-    python local/prepare_data.py --src_dir $data_dir/LibriTTS/$x --des_dir data/$x --instruct
+    # NOTE in CosyVoice3, we add instruct in sequence
+    python local/prepare_data.py --src_dir $data_dir/LibriTTS/$x --des_dir data/$x --instruct "You are a helpful assistant.<|endofprompt|>"
   done
 fi
 
+# NOTE embedding/token extraction is not necessary now as we support online feature extraction, but training speed will be influenced
 if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
   echo "Extract campplus speaker embedding, you will get spk2embedding.pt and utt2embedding.pt in data/$x dir"
   for x in train-clean-100 train-clean-360 train-other-500 dev-clean dev-other test-clean test-other; do
@@ -44,16 +46,15 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
   echo "Prepare required parquet format data, you should have prepared wav.scp/text/utt2spk/spk2utt/utt2embedding.pt/spk2embedding.pt/utt2speech_token.pt"
   for x in train-clean-100 train-clean-360 train-other-500 dev-clean dev-other test-clean test-other; do
     mkdir -p data/$x/parquet
-    tools/make_parquet_list.py --num_utts_per_parquet 1000 \
+    ../../../tools/make_parquet_list.py --num_utts_per_parquet 1000 \
       --num_processes 10 \
-      --instruct \
       --src_dir data/$x \
       --des_dir data/$x/parquet
   done
 fi
 
 # train llm
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
+export CUDA_VISIBLE_DEVICES="0"
 num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
 job_id=1986
 dist_backend="nccl"
@@ -67,16 +68,16 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   fi
   cat data/{train-clean-100,train-clean-360,train-other-500}/parquet/data.list > data/train.data.list
   cat data/{dev-clean,dev-other}/parquet/data.list > data/dev.data.list
-  # NOTE will update llm/hift training later
   for model in llm flow hifigan; do
     torchrun --nnodes=1 --nproc_per_node=$num_gpus \
         --rdzv_id=$job_id --rdzv_backend="c10d" --rdzv_endpoint="localhost:1234" \
-      cosyvoice/bin/train.py \
+      ../../../cosyvoice/bin/train.py \
       --train_engine $train_engine \
       --config conf/cosyvoice3.yaml \
       --train_data data/train.data.list \
       --cv_data data/dev.data.list \
       --qwen_pretrain_path $pretrained_model_dir/CosyVoice-BlankEN \
+      --onnx_path $pretrained_model_dir \
       --model $model \
       --checkpoint $pretrained_model_dir/$model.pt \
       --model_dir `pwd`/exp/cosyvoice3/$model/$train_engine \

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import logging
+import os, logging
 import random
 from typing import Dict, Optional
 import torch
@@ -19,6 +19,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from omegaconf import DictConfig
 from cosyvoice.utils.mask import make_pad_mask
+from cosyvoice.utils.onnx import SpeechTokenExtractor, online_feature, onnx_path
 
 
 class MaskedDiffWithXvec(torch.nn.Module):
@@ -179,14 +180,19 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         self.only_mask_loss = only_mask_loss
         self.token_mel_ratio = token_mel_ratio
         self.pre_lookahead_len = pre_lookahead_len
+        if online_feature is True:
+            self.speech_token_extractor = SpeechTokenExtractor(model_path=os.path.join(onnx_path, 'speech_tokenizer_v2.batch.onnx'))
 
     def forward(
             self,
             batch: dict,
             device: torch.device,
     ) -> Dict[str, Optional[torch.Tensor]]:
-        token = batch['speech_token'].to(device)
-        token_len = batch['speech_token_len'].to(device)
+        if 'speech_token' not in batch:
+            token, token_len = self.speech_token_extractor.inference(batch['whisper_feat'], batch['whisper_feat_len'], device)
+        else:
+            token = batch['speech_token'].to(device)
+            token_len = batch['speech_token_len'].to(device)
         feat = batch['speech_feat'].to(device)
         feat_len = batch['speech_feat_len'].to(device)
         embedding = batch['embedding'].to(device)
@@ -308,14 +314,19 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         self.decoder = decoder
         self.only_mask_loss = only_mask_loss
         self.token_mel_ratio = token_mel_ratio
+        if online_feature is True:
+            self.speech_token_extractor = SpeechTokenExtractor(model_path=os.path.join(onnx_path, 'speech_tokenizer_v3.batch.onnx'))
 
     def forward(
             self,
             batch: dict,
             device: torch.device,
     ) -> Dict[str, Optional[torch.Tensor]]:
-        token = batch['speech_token'].to(device)
-        token_len = batch['speech_token_len'].to(device)
+        if 'speech_token' not in batch:
+            token, token_len = self.speech_token_extractor.inference(batch['whisper_feat'], batch['whisper_feat_len'], device)
+        else:
+            token = batch['speech_token'].to(device)
+            token_len = batch['speech_token_len'].to(device)
         feat = batch['speech_feat'].to(device)
         feat_len = batch['speech_feat_len'].to(device)
         embedding = batch['embedding'].to(device)
@@ -332,8 +343,9 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
 
         # text encode
-        h, h_lengths = self.encoder(token, token_len, streaming=streaming)
-        h = self.encoder_proj(h)
+        h = self.pre_lookahead_layer(token)
+        h = h.repeat_interleave(self.token_mel_ratio, dim=1)
+        mask = mask.repeat_interleave(self.token_mel_ratio, dim=1).squeeze(dim=-1)
 
         # get conditions
         conds = torch.zeros(feat.shape, device=token.device)
@@ -344,7 +356,6 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             conds[i, :index] = feat[i, :index]
         conds = conds.transpose(1, 2)
 
-        mask = (~make_pad_mask(h_lengths.sum(dim=-1).squeeze(dim=1))).to(h)
         loss, _ = self.decoder.compute_loss(
             feat.transpose(1, 2).contiguous(),
             mask.unsqueeze(1),
@@ -390,17 +401,91 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
-        feat, _ = self.decoder(
+        feat, _, _ = self.decoder.forward(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
             n_timesteps=10,
-            streaming=streaming
+            streaming=streaming,
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
         return feat.float(), None
+
+    @torch.inference_mode()
+    def inference_chunk(self,
+                        token,
+                        token_offset,
+                        token_len,
+                        prompt_token,
+                        prompt_token_len,
+                        prompt_feat,
+                        prompt_feat_len,
+                        conv_cache,
+                        att_cache,
+                        embedding,
+                        streaming,
+                        finalize,
+                        init_cache=False,
+                        chunk_size=25,
+                        n_timesteps=10):
+        assert token.shape[0] == 1
+        embedding = F.normalize(embedding, dim=1)
+        embedding = self.spk_embed_affine_layer(embedding)
+
+        token, real_token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+        if token_len.item() == 0:
+            real_token_len = (real_token_len - 3) // chunk_size * chunk_size + 3
+            token = token[:, :real_token_len]
+        assert finalize or real_token_len.item() % chunk_size == 3
+
+        mask = (~make_pad_mask(real_token_len)).unsqueeze(-1).to(embedding)
+        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+
+        if finalize is True or init_cache is True:
+            h = self.pre_lookahead_layer(token)
+        else:
+            h = self.pre_lookahead_layer(token[:, :-self.pre_lookahead_len], context=token[:, -self.pre_lookahead_len:])
+        h = h.repeat_interleave(self.token_mel_ratio, dim=1)
+
+        h_offset = 0
+        if att_cache is not None:
+            h_offset = att_cache[0].shape[0]
+
+        if token_len.item() == 0:
+            conds = torch.zeros([1, h.shape[1], self.output_size], device=token.device).to(h.dtype)
+            conds = conds.transpose(1, 2)
+            mask = (~make_pad_mask(torch.tensor([h.shape[1]]))).to(h)
+        else:
+            h = h[:, h_offset:, :]
+            conds = torch.zeros([1, h.shape[1], self.output_size], device=token.device).to(h.dtype)
+            if h_offset < prompt_token_len.item() * self.token_mel_ratio:
+                left = prompt_token_len.item() * self.token_mel_ratio - h_offset
+                conds[:, :left, :] = prompt_feat[:, -left:, :]
+            conds = conds.transpose(1, 2)
+            mask = (~make_pad_mask(torch.tensor([h.shape[1]]))).to(h)
+
+        x_offset = torch.tensor(h_offset, dtype=torch.int32, device=token.device)
+        feat, new_conv_cache, new_att_cache = self.decoder.forward_chunk(
+            mu=h.transpose(1, 2).contiguous(),
+            x_offset=x_offset,
+            mask=mask.unsqueeze(1),
+            spks=embedding,
+            cond=conds,
+            n_timesteps=n_timesteps,
+            streaming=streaming,
+            conv_cache=conv_cache,
+            att_cache=att_cache,
+        )
+        if init_cache is True:
+            feat = feat[:, :, :0]
+        else:
+            estimated_token_offset = x_offset - prompt_token_len * self.token_mel_ratio
+            if token_offset * self.token_mel_ratio - estimated_token_offset > 0:
+                feat = feat[:, :, (token_offset * self.token_mel_ratio - estimated_token_offset):]
+
+        return feat.float(), new_conv_cache, new_att_cache
 
 
 if __name__ == '__main__':

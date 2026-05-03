@@ -20,18 +20,9 @@ import numpy as np
 import whisper
 from typing import Callable
 import torchaudio.compliance.kaldi as kaldi
-import torchaudio
 import os
 import re
 import inflect
-try:
-    import ttsfrd
-    use_ttsfrd = True
-except ImportError:
-    print("failed to import ttsfrd, use wetext instead")
-    from wetext import Normalizer as ZhNormalizer
-    from wetext import Normalizer as EnNormalizer
-    use_ttsfrd = False
 from cosyvoice.utils.file_utils import logging, load_wav
 from cosyvoice.utils.frontend_utils import contains_chinese, replace_blank, replace_corner_mark, remove_bracket, spell_out_number, split_paragraph, is_only_punctuation
 
@@ -56,21 +47,33 @@ class CosyVoiceFrontEnd:
                                                                      providers=["CUDAExecutionProvider" if torch.cuda.is_available() else
                                                                                 "CPUExecutionProvider"])
         if os.path.exists(spk2info):
-            self.spk2info = torch.load(spk2info, map_location=self.device)
+            self.spk2info = torch.load(spk2info, map_location=self.device, weights_only=True)
         else:
             self.spk2info = {}
         self.allowed_special = allowed_special
-        self.use_ttsfrd = use_ttsfrd
-        if self.use_ttsfrd:
+        self.inflect_parser = inflect.engine()
+        # NOTE compatible when no text frontend tool is avaliable
+        try:
+            import ttsfrd
             self.frd = ttsfrd.TtsFrontendEngine()
             ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
             assert self.frd.initialize('{}/../../pretrained_models/CosyVoice-ttsfrd/resource'.format(ROOT_DIR)) is True, \
                 'failed to initialize ttsfrd resource'
             self.frd.set_lang_type('pinyinvg')
-        else:
-            self.zh_tn_model = ZhNormalizer(remove_erhua=False)
-            self.en_tn_model = EnNormalizer()
-            self.inflect_parser = inflect.engine()
+            self.text_frontend = 'ttsfrd'
+            logging.info('use ttsfrd frontend')
+        except:
+            try:
+                from wetext import Normalizer as ZhNormalizer
+                from wetext import Normalizer as EnNormalizer
+                self.zh_tn_model = ZhNormalizer(remove_erhua=False)
+                self.en_tn_model = EnNormalizer()
+                self.text_frontend = 'wetext'
+                logging.info('use wetext frontend')
+            except:
+                self.text_frontend = ''
+                logging.info('no frontend is avaliable')
+
 
     def _extract_text_token(self, text):
         if isinstance(text, Generator):
@@ -131,12 +134,13 @@ class CosyVoiceFrontEnd:
         if text_frontend is False or text == '':
             return [text] if split is True else text
         text = text.strip()
-        if self.use_ttsfrd:
+        if self.text_frontend == 'ttsfrd':
             texts = [i["text"] for i in json.loads(self.frd.do_voicegen_frd(text))["sentences"]]
             text = ''.join(texts)
         else:
             if contains_chinese(text):
-                text = self.zh_tn_model.normalize(text)
+                if self.text_frontend == 'wetext':
+                    text = self.zh_tn_model.normalize(text)
                 text = text.replace("\n", "")
                 text = replace_blank(text)
                 text = replace_corner_mark(text)
@@ -147,7 +151,8 @@ class CosyVoiceFrontEnd:
                 texts = list(split_paragraph(text, partial(self.tokenizer.encode, allowed_special=self.allowed_special), "zh", token_max_n=80,
                                              token_min_n=60, merge_len=20, comma_split=False))
             else:
-                text = self.en_tn_model.normalize(text)
+                if self.text_frontend == 'wetext':
+                    text = self.en_tn_model.normalize(text)
                 text = spell_out_number(text, self.inflect_parser)
                 texts = list(split_paragraph(text, partial(self.tokenizer.encode, allowed_special=self.allowed_special), "en", token_max_n=80,
                                              token_min_n=60, merge_len=20, comma_split=False))
@@ -178,7 +183,7 @@ class CosyVoiceFrontEnd:
                            'prompt_speech_feat': speech_feat, 'prompt_speech_feat_len': speech_feat_len,
                            'llm_embedding': embedding, 'flow_embedding': embedding}
         else:
-            model_input = self.spk2info[zero_shot_spk_id]
+            model_input = {**self.spk2info[zero_shot_spk_id]}
         model_input['text'] = tts_text_token
         model_input['text_len'] = tts_text_token_len
         return model_input
