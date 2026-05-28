@@ -1,0 +1,2 @@
+{"utt_id":"sample_000001","audio":"clips/sample_000001.wav","text":"Exact words spoken in this clip.","speaker":"target","source":"video001.mp4","start":12.34,"end":18.90,"split":"train"}
+{"utt_id":"sample_000002","audio":"clips/sample_000002.wav","text":"Another clean utterance from the same target voice.","speaker":"target","source":"video001.mp4","start":20.10,"end":25.40,"split":"dev"}

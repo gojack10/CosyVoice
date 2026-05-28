@@ -1,0 +1,10 @@
+data/
+logs/
+outputs/
+exp/
+exp_smoke/
+tensorboard/
+tensorboard_smoke/
+*.wav
+*.pt
+*.tar
