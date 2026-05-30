@@ -1,4 +1,4 @@
-# Fork: Jack ten Bosch — VEGA Voice + ANE Runtime
+# Fork: Jack ten Bosch  VEGA Voice + ANE Runtime
 
 Fork of [FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice). I added:
 
