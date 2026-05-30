@@ -193,7 +193,11 @@ def _lora_compatible_inference(
             yield int(token)
         return
     mlx_backend = getattr(self, "_mlx_backend", None)
-    if mlx_backend is not None:
+    ane_backend = getattr(self, "_ane_backend", None)
+    if mlx_backend is not None and ane_backend is not None:
+        raise RuntimeError("choose only one accelerated LLM backend: MLX or ANE")
+    llm_backend = mlx_backend or ane_backend
+    if llm_backend is not None:
         min_token_text_ratio = float(getattr(self, "_min_token_text_ratio", min_token_text_ratio))
         max_token_text_ratio = float(getattr(self, "_max_token_text_ratio", max_token_text_ratio))
         min_len = int((text_len - prompt_text_len) * min_token_text_ratio)
@@ -217,7 +221,7 @@ def _lora_compatible_inference(
                 for token in prefix_tokens:
                     yield token
                 return
-        for token in mlx_backend.generate(text, prompt_speech_token, min_len, max_len, prefix_tokens=prefix_tokens):
+        for token in llm_backend.generate(text, prompt_speech_token, min_len, max_len, prefix_tokens=prefix_tokens):
             yield token
         return
     text_emb = _embed_tokens(self, text)
@@ -386,6 +390,10 @@ def main() -> int:
     parser.add_argument("--mlx-llm", action="store_true", help="run CosyVoice3 Qwen speech-token decode in MLX")
     parser.add_argument("--mlx-dtype", default="float32", choices=("float32", "float16", "bfloat16"), help="dtype for MLX Qwen weights/activations")
     parser.add_argument("--mlx-native-sampling", action="store_true", help="sample top-k/top-p directly in MLX instead of CPU torch-style sampling")
+    parser.add_argument("--ane-llm", action="store_true", help="run CosyVoice3 Qwen speech-token decode through Anemll/CoreML part-2 on ANE")
+    parser.add_argument("--ane-mlpackage", default="/tmp/cosyvoice3_ane/coreml/cosyvoice3_qwen2_FFN_chunk_01of01.mlpackage", help="CoreML mlpackage produced by ane_convert_part2.py")
+    parser.add_argument("--ane-context-length", type=int, default=1024, help="fixed CoreML KV context length used at conversion")
+    parser.add_argument("--ane-compute-units", default="cpu_and_ne", choices=("all", "cpu_and_ne", "cpu_only", "cpu_and_gpu"), help="CoreML compute units for ANE backend")
     parser.add_argument("--flow-steps", type=int, default=10, help="flow diffusion Euler steps; lower is faster but quality-sensitive")
     parser.add_argument("--flow-cfg-rate", type=float, default=None, help="override flow classifier-free guidance rate")
     parser.add_argument("--profile-phases", action="store_true", help="synchronize and print LLM/flow/HiFT phase timings")
@@ -406,6 +414,8 @@ def main() -> int:
     parser.add_argument("--live-token-prefix-len", type=int, default=0, help="generate this many initial speech tokens with the PyTorch LLM at runtime, then let MLX continue")
     parser.add_argument("--no-reset-seed-after-live-prefix", action="store_true", help="do not reset RNG before MLX continuation after live prefix generation")
     args = parser.parse_args()
+    if args.mlx_llm and args.ane_llm:
+        raise SystemExit("choose only one accelerated LLM backend: --mlx-llm or --ane-llm")
 
     model_dir = Path(args.model_dir).expanduser().resolve()
     adapter_dir = Path(args.adapter_dir).expanduser().resolve()
@@ -450,6 +460,9 @@ def main() -> int:
     cosyvoice.model.llm._sampling_ras_tau_r = args.ras_tau_r
     cosyvoice.model.llm._sampling_seed = args.seed
     cosyvoice.model.llm._mlx_dtype = args.mlx_dtype
+    cosyvoice.model.llm._ane_mlpackage = args.ane_mlpackage
+    cosyvoice.model.llm._ane_context_length = args.ane_context_length
+    cosyvoice.model.llm._ane_compute_units = args.ane_compute_units
     cosyvoice.model.llm._live_speech_token_prefix_len = args.live_token_prefix_len
     cosyvoice.model.llm._reset_seed_after_live_prefix = not args.no_reset_seed_after_live_prefix
     cosyvoice.model.llm._mlx_native_sampling = args.mlx_native_sampling
@@ -469,6 +482,9 @@ def main() -> int:
     if args.mlx_llm:
         from local_voice_pipeline.mlx_qwen_backend import attach_mlx_qwen
         attach_mlx_qwen(cosyvoice.model.llm)
+    if args.ane_llm:
+        from local_voice_pipeline.ane_qwen_backend import attach_ane_qwen
+        attach_ane_qwen(cosyvoice.model.llm)
     cosyvoice.model._profile_inference = args.profile_phases
     cosyvoice.model.flow._inference_timesteps = args.flow_steps
     if args.flow_cfg_rate is not None:
@@ -481,7 +497,7 @@ def main() -> int:
     move_model(
         cosyvoice,
         device,
-        skip_llm_device=(args.mlx_llm and args.live_token_prefix_len <= 0),
+        skip_llm_device=((args.mlx_llm or args.ane_llm) and args.live_token_prefix_len <= 0),
         flow_device=flow_device,
         hift_device=hift_device,
         flow_conditioner_device=flow_conditioner_device,
@@ -574,6 +590,9 @@ def main() -> int:
         "sample_rate": cosyvoice.sample_rate,
         "duration_sec": speech.shape[1] / cosyvoice.sample_rate,
         "adapter_dir": str(adapter_dir),
+        "flow_ckpt": args.flow_ckpt,
+        "hift_ckpt": args.hift_ckpt,
+        "double": args.double,
         "prompt_wav": str(prompt_wav),
         "prompt_text": prompt_text,
         "text": args.text,
@@ -594,11 +613,20 @@ def main() -> int:
         "mlx_llm": args.mlx_llm,
         "mlx_dtype": args.mlx_dtype,
         "mlx_native_sampling": args.mlx_native_sampling,
+        "ane_llm": args.ane_llm,
+        "ane_mlpackage": args.ane_mlpackage,
+        "ane_context_length": args.ane_context_length,
+        "ane_compute_units": args.ane_compute_units,
         "live_token_prefix_len": args.live_token_prefix_len,
         "reset_seed_after_live_prefix": not args.no_reset_seed_after_live_prefix,
         "flow_steps": args.flow_steps,
         "flow_cfg_rate": args.flow_cfg_rate,
         "mask_all_stop_before_min_len": args.mask_all_stop_before_min_len,
+        "force_tokens_json": args.force_tokens_json,
+        "force_token_prefix_json": args.force_token_prefix_json,
+        "force_token_prefix_len": args.force_token_prefix_len,
+        "chunk_separator": args.chunk_separator,
+        "no_split": args.no_split,
         "profile_phases": args.profile_phases,
         "remove_hift_weight_norm": not args.keep_hift_weight_norm,
         "speed": args.speed,
