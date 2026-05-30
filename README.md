@@ -1,3 +1,23 @@
+# Fork: Jack ten Bosch — VEGA Voice + ANE Runtime
+
+Fork of [FunAudioLLM/CosyVoice](https://github.com/FunAudioLLM/CosyVoice). I added:
+
+- **ANE Qwen backend**
+  - Ports the CosyVoice3 Qwen2 speech-token LLM to Apple Neural Engine.
+  - Teacher-forced KL < 0.0003, top15 overlap > 0.99.
+  - My review: quality is good. Runtime is not daily-drivable yet. I am fixing the Python-to-CoreML overhead.
+
+- **VEGA runtime port**
+  - MLX Qwen LLM backend, device placement, and a unison-doubler post-stage.
+  - Runs on M5 Max. Moved CPU baseline from ~2.59 RTF to ~0.197 RTF.
+  - My review: voice quality holds and the doubler produces the right processed effect.
+
+- **Local adaptation pipeline**
+  - LoRA finetuning, flow finetuning for timbre, and render/audition tooling.
+  - Built for personal voice datasets.
+
+---
+
 ![SVG Banners](https://svg-banners.vercel.app/api?type=origin&text1=CosyVoice🤠&text2=Text-to-Speech%20💖%20Large%20Language%20Model&width=800&height=210)
 
 ## 👉🏻 CosyVoice 👈🏻
