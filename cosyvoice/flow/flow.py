@@ -378,6 +378,18 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
                   streaming,
                   finalize):
         assert token.shape[0] == 1
+        # Allow the lightweight conditioning path and the heavy flow decoder to
+        # live on different devices for quality/speed isolation.  By default all
+        # flow submodules share one device, so this is a no-op.
+        cond_device = next(self.input_embedding.parameters()).device
+        decoder_device = next(self.decoder.parameters()).device
+        token = token.to(cond_device)
+        token_len = token_len.to(cond_device)
+        prompt_token = prompt_token.to(cond_device)
+        prompt_token_len = prompt_token_len.to(cond_device)
+        prompt_feat_cond = prompt_feat.to(cond_device)
+        embedding = embedding.to(cond_device)
+
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
@@ -393,20 +405,22 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         else:
             h = self.pre_lookahead_layer(token[:, :-self.pre_lookahead_len], context=token[:, -self.pre_lookahead_len:])
         h = h.repeat_interleave(self.token_mel_ratio, dim=1)
-        mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
+        mel_len1, mel_len2 = prompt_feat_cond.shape[1], h.shape[1] - prompt_feat_cond.shape[1]
 
         # get conditions
-        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
-        conds[:, :mel_len1] = prompt_feat
-        conds = conds.transpose(1, 2)
+        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=cond_device, dtype=h.dtype)
+        conds[:, :mel_len1] = prompt_feat_cond
+        conds = conds.transpose(1, 2).contiguous().to(decoder_device)
 
-        mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        mu = h.transpose(1, 2).contiguous().to(decoder_device)
+        embedding = embedding.to(decoder_device)
+        mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2], device=decoder_device))).to(mu)
         feat, _ = self.decoder(
-            mu=h.transpose(1, 2).contiguous(),
+            mu=mu,
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10,
+            n_timesteps=int(getattr(self, '_inference_timesteps', 10)),
             streaming=streaming
         )
         feat = feat[:, :, mel_len1:]

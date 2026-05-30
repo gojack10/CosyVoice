@@ -114,7 +114,8 @@ class ConditionalCFM(BASECFM):
                 streaming
             )
             dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-            dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt)
+            cfg_rate = float(getattr(self, '_inference_cfg_rate', self.inference_cfg_rate))
+            dphi_dt = ((1.0 + cfg_rate) * dphi_dt - cfg_rate * cfg_dphi_dt)
             x = x + dt * dphi_dt
             t = t + dt
             sol.append(x)

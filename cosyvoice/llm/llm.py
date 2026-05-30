@@ -22,6 +22,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from transformers import Qwen2ForCausalLM
+from transformers.cache_utils import Cache
 from torch.nn.utils.rnn import pad_sequence, unpad_sequence
 from cosyvoice.utils.common import IGNORE_ID
 from cosyvoice.transformer.label_smoothing_loss import LabelSmoothingLoss
@@ -29,6 +30,60 @@ from cosyvoice.utils.common import th_accuracy
 from cosyvoice.utils.file_utils import logging
 from cosyvoice.utils.mask import make_pad_mask
 from cosyvoice.utils.onnx import SpeechTokenExtractor, online_feature, onnx_path
+
+
+class MpsSliceCache(Cache):
+    """Preallocated KV cache that avoids DynamicCache torch.cat on MPS.
+
+    HF StaticCache uses index_copy_, which falls back to CPU on MPS.  This cache
+    appends with integer slice copy_ instead, while presenting the same Cache API
+    as DynamicCache to Qwen2Model.
+    """
+
+    def __init__(self, max_cache_len: int):
+        super().__init__()
+        self.max_cache_len = int(max_cache_len)
+        self.key_cache = []
+        self.value_cache = []
+        self.lengths = []
+        self._seen_tokens = 0
+
+    def _ensure_layer(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int) -> None:
+        while len(self.key_cache) <= layer_idx:
+            self.key_cache.append(None)
+            self.value_cache.append(None)
+            self.lengths.append(0)
+        if self.key_cache[layer_idx] is None:
+            key_shape = list(key_states.shape)
+            value_shape = list(value_states.shape)
+            key_shape[-2] = self.max_cache_len
+            value_shape[-2] = self.max_cache_len
+            self.key_cache[layer_idx] = torch.empty(key_shape, dtype=key_states.dtype, device=key_states.device)
+            self.value_cache[layer_idx] = torch.empty(value_shape, dtype=value_states.dtype, device=value_states.device)
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int, cache_kwargs=None):
+        self._ensure_layer(key_states, value_states, layer_idx)
+        pos = self.lengths[layer_idx]
+        seq = key_states.shape[-2]
+        end = pos + seq
+        if end > self.max_cache_len:
+            raise RuntimeError(f"MpsSliceCache capacity exceeded: {end} > {self.max_cache_len}")
+        self.key_cache[layer_idx][:, :, pos:end, :].copy_(key_states)
+        self.value_cache[layer_idx][:, :, pos:end, :].copy_(value_states)
+        self.lengths[layer_idx] = end
+        if layer_idx == 0:
+            self._seen_tokens = end
+        return self.key_cache[layer_idx][:, :, :end, :], self.value_cache[layer_idx][:, :, :end, :]
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        if layer_idx is None:
+            layer_idx = 0
+        if layer_idx < len(self.lengths):
+            return self.lengths[layer_idx]
+        return 0
+
+    def get_max_cache_shape(self) -> Optional[int]:
+        return self.max_cache_len
 
 
 class TransformerLM(torch.nn.Module):
@@ -212,8 +267,8 @@ class TransformerLM(torch.nn.Module):
                                                                   att_cache=att_cache, cnn_cache=cnn_cache,
                                                                   att_mask=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]),
                                                                                                  device=lm_input.device)).to(torch.bool))
-            logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
-            top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False)
+            scores = self.llm_decoder(y_pred[:, -1])
+            top_ids = self.sampling_ids(scores.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False)
             if top_ids == self.eos_token:
                 break
             # in stream mode, yield token one by one
@@ -240,18 +295,31 @@ class Qwen2Encoder(torch.nn.Module):
         return outs.hidden_states[-1], masks.unsqueeze(1)
 
     def forward_one_step(self, xs, masks, cache=None):
-        input_masks = masks[:, -1, :]
+        # There is no padding in CosyVoice inference (batch=1, all prompt/token
+        # positions valid). Also bypass Qwen2ForCausalLM.lm_head: CosyVoice uses
+        # its own speech-token decoder, so HF text-vocab logits are pure overhead.
+        decoder = getattr(self.model, 'model', None)
+        if decoder is not None:
+            outs = decoder(
+                inputs_embeds=xs,
+                attention_mask=None,
+                output_hidden_states=False,
+                return_dict=False,
+                use_cache=True,
+                past_key_values=cache,
+            )
+            return outs[0], outs[1]
+        # Fallback for unusual wrappers where the underlying Qwen2Model is
+        # not directly exposed; keep exact previous behavior.
         outs = self.model(
             inputs_embeds=xs,
-            attention_mask=input_masks,
+            attention_mask=None,
             output_hidden_states=True,
             return_dict=True,
             use_cache=True,
             past_key_values=cache,
         )
-        xs = outs.hidden_states[-1]
-        new_cache = outs.past_key_values
-        return xs, new_cache
+        return outs.hidden_states[-1], outs.past_key_values
 
 
 class Qwen2LM(TransformerLM):
@@ -534,13 +602,13 @@ class Qwen2LM(TransformerLM):
                 self.vllm_output_queue.pop(uuid)
         else:
             out_tokens = []
-            cache = None
+            cache = MpsSliceCache(max_len + lm_input.shape[1] + 4) if lm_input.device.type == 'mps' else None
             for i in range(max_len):
                 y_pred, cache = self.llm.forward_one_step(lm_input,
-                                                          masks=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device)).to(torch.bool),
+                                                          masks=None,
                                                           cache=cache)
-                logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
-                top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False)
+                scores = self.llm_decoder(y_pred[:, -1])
+                top_ids = self.sampling_ids(scores.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False)
                 if top_ids in self.stop_token_ids:
                     break
                 # in stream mode, yield token one by one
@@ -622,12 +690,12 @@ class Qwen2LM(TransformerLM):
                     y_pred, cache = self.llm.forward_one_step(lm_input,
                                                               masks=torch.tril(torch.ones((1, seq_len, seq_len), device=lm_input.device)).to(torch.bool),
                                                               cache=cache)
-                    logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
+                    scores = self.llm_decoder(y_pred[:, -1])
                     if next_fill_index != -1 and len(out_tokens) == next_fill_index:
                         top_ids = self.fill_token
                         next_fill_index += (self.mix_ratio[1] + 1)
                     else:
-                        top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True)
+                        top_ids = self.sampling_ids(scores.squeeze(dim=0), out_tokens, sampling, ignore_eos=True)
                     if top_ids == self.fill_token:
                         next_fill_index = len(out_tokens) + self.mix_ratio[1] + 1
                         logging.info('fill_token index {} next fill_token index {}'.format(len(out_tokens), next_fill_index))
@@ -648,8 +716,8 @@ class Qwen2LM(TransformerLM):
             y_pred, cache = self.llm.forward_one_step(lm_input,
                                                       masks=torch.tril(torch.ones((1, seq_len, seq_len), device=lm_input.device)).to(torch.bool),
                                                       cache=cache)
-            logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
-            top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=False)
+            scores = self.llm_decoder(y_pred[:, -1])
+            top_ids = self.sampling_ids(scores.squeeze(dim=0), out_tokens, sampling, ignore_eos=False)
             out_tokens.append(top_ids)
             if top_ids >= self.speech_token_size:
                 if top_ids == self.eos_token:

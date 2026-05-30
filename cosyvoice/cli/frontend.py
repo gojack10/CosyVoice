@@ -41,7 +41,10 @@ class CosyVoiceFrontEnd:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        option.intra_op_num_threads = 1
+        # Prompt frontend ONNX work is CPU-bound on Apple Silicon and is now a
+        # meaningful fraction of timed inference.  Use a few CPU threads by
+        # default; override with COSYVOICE_ORT_THREADS if needed.
+        option.intra_op_num_threads = int(os.environ.get('COSYVOICE_ORT_THREADS', '12'))
         self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=["CPUExecutionProvider"])
         self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
                                                                      providers=["CUDAExecutionProvider" if torch.cuda.is_available() else
@@ -52,6 +55,7 @@ class CosyVoiceFrontEnd:
             self.spk2info = {}
         self.allowed_special = allowed_special
         self.inflect_parser = inflect.engine()
+        self._wav_cache = {}
         # NOTE compatible when no text frontend tool is avaliable
         try:
             import ttsfrd
@@ -75,6 +79,14 @@ class CosyVoiceFrontEnd:
                 logging.info('no frontend is avaliable')
 
 
+    def _load_wav_cached(self, wav_path, sample_rate):
+        key = (str(wav_path), int(sample_rate))
+        speech = self._wav_cache.get(key)
+        if speech is None:
+            speech = load_wav(wav_path, sample_rate)
+            self._wav_cache[key] = speech
+        return speech
+
     def _extract_text_token(self, text):
         if isinstance(text, Generator):
             logging.info('get tts_text generator, will return _extract_text_token_generator!')
@@ -93,7 +105,7 @@ class CosyVoiceFrontEnd:
                 yield text_token[:, i: i + 1]
 
     def _extract_speech_token(self, prompt_wav):
-        speech = load_wav(prompt_wav, 16000)
+        speech = self._load_wav_cached(prompt_wav, 16000)
         assert speech.shape[1] / 16000 <= 30, 'do not support extract speech token for audio longer than 30s'
         feat = whisper.log_mel_spectrogram(speech, n_mels=128)
         speech_token = self.speech_tokenizer_session.run(None,
@@ -106,7 +118,7 @@ class CosyVoiceFrontEnd:
         return speech_token, speech_token_len
 
     def _extract_spk_embedding(self, prompt_wav):
-        speech = load_wav(prompt_wav, 16000)
+        speech = self._load_wav_cached(prompt_wav, 16000)
         feat = kaldi.fbank(speech,
                            num_mel_bins=80,
                            dither=0,
@@ -118,7 +130,7 @@ class CosyVoiceFrontEnd:
         return embedding
 
     def _extract_speech_feat(self, prompt_wav):
-        speech = load_wav(prompt_wav, 24000)
+        speech = self._load_wav_cached(prompt_wav, 24000)
         speech_feat = self.feat_extractor(speech).squeeze(dim=0).transpose(0, 1).to(self.device)
         speech_feat = speech_feat.unsqueeze(dim=0)
         speech_feat_len = torch.tensor([speech_feat.shape[1]], dtype=torch.int32).to(self.device)

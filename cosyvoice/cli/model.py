@@ -335,11 +335,19 @@ class CosyVoice2Model(CosyVoiceModel):
         with self.lock:
             self.tts_speech_token_dict[this_uuid], self.llm_end_dict[this_uuid] = [], False
             self.hift_cache_dict[this_uuid] = None
-        if source_speech_token.shape[1] == 0:
+        run_llm_inline = (stream is False and source_speech_token.shape[1] == 0 and
+                          getattr(self.llm, '_mlx_backend', None) is not None)
+        if run_llm_inline:
+            p = None
+        elif source_speech_token.shape[1] == 0:
             p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
         else:
             p = threading.Thread(target=self.vc_job, args=(source_speech_token, this_uuid))
-        p.start()
+        llm_start = time.time()
+        if run_llm_inline:
+            self.llm_job(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid)
+        else:
+            p.start()
         if stream is True:
             token_offset = 0
             prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / self.token_hop_len) * self.token_hop_len - flow_prompt_speech_token.shape[1])
@@ -374,8 +382,12 @@ class CosyVoice2Model(CosyVoiceModel):
             yield {'tts_speech': this_tts_speech.cpu()}
         else:
             # deal with all tokens
-            p.join()
+            if p is not None:
+                p.join()
+            llm_sec = time.time() - llm_start
             this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+            profile_enabled = bool(getattr(self, '_profile_inference', False))
+            wav_start = time.time() if profile_enabled else None
             this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                              prompt_token=flow_prompt_speech_token,
                                              prompt_feat=prompt_speech_feat,
@@ -384,6 +396,20 @@ class CosyVoice2Model(CosyVoiceModel):
                                              uuid=this_uuid,
                                              finalize=True,
                                              speed=speed)
+            if profile_enabled:
+                if self.device.type == 'mps' and hasattr(torch, 'mps'):
+                    torch.mps.synchronize()
+                token2wav_sec = time.time() - wav_start
+                profile = getattr(self, '_last_token2wav_profile', {})
+                print('PROFILE llm_sec={:.6f} token_count={} token2wav_sec={:.6f} flow_sec={:.6f} hift_sec={:.6f} mel_frames={} speech_samples={}'.format(
+                    llm_sec,
+                    this_tts_speech_token.shape[1],
+                    token2wav_sec,
+                    float(profile.get('flow_sec', -1.0)),
+                    float(profile.get('hift_sec', -1.0)),
+                    int(profile.get('mel_frames', -1)),
+                    int(this_tts_speech.shape[1]),
+                ), flush=True)
             yield {'tts_speech': this_tts_speech.cpu()}
         with self.lock:
             self.tts_speech_token_dict.pop(this_uuid)
@@ -424,6 +450,10 @@ class CosyVoice3Model(CosyVoice2Model):
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, token_offset, uuid, stream=False, finalize=False, speed=1.0):
         with torch.cuda.amp.autocast(self.fp16):
+            profile_enabled = bool(getattr(self, '_profile_inference', False))
+            if profile_enabled and self.device.type == 'mps' and hasattr(torch, 'mps'):
+                torch.mps.synchronize()
+            flow_start = time.time() if profile_enabled else None
             tts_mel, _ = self.flow.inference(token=token.to(self.device, dtype=torch.int32),
                                              token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
                                              prompt_token=prompt_token.to(self.device),
@@ -433,7 +463,13 @@ class CosyVoice3Model(CosyVoice2Model):
                                              embedding=embedding.to(self.device),
                                              streaming=stream,
                                              finalize=finalize)
+            if profile_enabled and self.device.type == 'mps' and hasattr(torch, 'mps'):
+                torch.mps.synchronize()
+            flow_sec = time.time() - flow_start if profile_enabled else -1.0
             tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]
+            hift_device = next(self.hift.parameters()).device
+            if tts_mel.device != hift_device:
+                tts_mel = tts_mel.to(hift_device)
             # append mel cache
             if self.hift_cache_dict[uuid] is not None:
                 hift_cache_mel = self.hift_cache_dict[uuid]['mel']
@@ -444,7 +480,15 @@ class CosyVoice3Model(CosyVoice2Model):
             if speed != 1.0:
                 assert token_offset == 0 and finalize is True, 'speed change only support non-stream inference mode'
                 tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
+            if profile_enabled and self.device.type == 'mps' and hasattr(torch, 'mps'):
+                torch.mps.synchronize()
+            hift_start = time.time() if profile_enabled else None
             tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=finalize)
+            if profile_enabled and self.device.type == 'mps' and hasattr(torch, 'mps'):
+                torch.mps.synchronize()
+            hift_sec = time.time() - hift_start if profile_enabled else -1.0
+            if profile_enabled:
+                self._last_token2wav_profile = {'flow_sec': flow_sec, 'hift_sec': hift_sec, 'mel_frames': tts_mel.shape[2]}
             tts_speech = tts_speech[:, self.hift_cache_dict[uuid]['speech_offset']:]
             self.hift_cache_dict[uuid]['speech_offset'] += tts_speech.shape[1]
         return tts_speech

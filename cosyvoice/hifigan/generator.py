@@ -474,6 +474,31 @@ class HiFTGenerator(nn.Module):
         self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
         self.f0_predictor = f0_predictor
 
+    def _predict_f0(self, speech_feat: torch.Tensor, finalize: Optional[bool] = None, prefer_float64: bool = False) -> torch.Tensor:
+        """Run f0 prediction on CPU float64 when MPS would otherwise crash.
+
+        PyTorch MPS does not support float64. For MPS inference, keep only the
+        f0 predictor on CPU float64, then move the predicted f0 contour back to
+        the mel/vocoder device so source generation and decode stay on MPS.
+        """
+        orig_device, orig_dtype = speech_feat.device, speech_feat.dtype
+        use_cpu_float64 = orig_device.type == 'mps' or prefer_float64
+        f0_input = speech_feat
+        if use_cpu_float64:
+            # Split device and dtype conversions: MPS tensors cannot be cast to
+            # float64 until after they have left the MPS device.  Cache the
+            # converted predictor so the hot path only copies the mel features.
+            if getattr(self, '_f0_cpu_float64_ready', False) is False:
+                self.f0_predictor.to(device='cpu')
+                self.f0_predictor.to(dtype=torch.float64)
+                self._f0_cpu_float64_ready = True
+            f0_input = speech_feat.detach().to(device='cpu').to(dtype=torch.float64)
+        if finalize is None:
+            f0 = self.f0_predictor(f0_input)
+        else:
+            f0 = self.f0_predictor(f0_input, finalize=finalize)
+        return f0.to(device=orig_device, dtype=orig_dtype)
+
     def remove_weight_norm(self):
         print('Removing weight norm...')
         for l in self.ups:
@@ -557,7 +582,7 @@ class HiFTGenerator(nn.Module):
     @torch.inference_mode()
     def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
         # mel->f0
-        f0 = self.f0_predictor(speech_feat)
+        f0 = self._predict_f0(speech_feat)
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
         s, _, _ = self.m_source(s)
@@ -712,9 +737,9 @@ class CausalHiFTGenerator(HiFTGenerator):
 
     @torch.inference_mode()
     def inference(self, speech_feat: torch.Tensor, finalize: bool = True) -> torch.Tensor:
-        # mel->f0 NOTE f0_predictor precision is crucial for causal inference, move self.f0_predictor to cpu if necessary
-        self.f0_predictor.to(torch.float64)
-        f0 = self.f0_predictor(speech_feat.to(torch.float64), finalize=finalize).to(speech_feat)
+        # mel->f0 NOTE f0_predictor precision is crucial for causal inference.
+        # On MPS, run only this module on CPU float64; keep the rest of HiFT on MPS.
+        f0 = self._predict_f0(speech_feat, finalize=finalize, prefer_float64=True)
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
         s, _, _ = self.m_source(s)
